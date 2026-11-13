@@ -284,7 +284,7 @@ open class PetOverlayService : Service() {
         scope.cancel()
         uiHandler.removeCallbacksAndMessages(null)
         settingsJobs.forEach { it.cancel() }
-        savePosition()
+        savePositionDetached()
         removeMenu()
         bubble?.dismiss()
         stopIsland()
@@ -952,8 +952,12 @@ open class PetOverlayService : Service() {
         fromCollision: Boolean = false,
         fromPhysics: Boolean = false,
     ): Boolean {
-        val lp = params ?: return false
-        val c = container ?: return false
+        val lp = params
+        val c = container
+        if (lp == null || c == null) {
+            if (fromAutoMove) engine.cancelMove()
+            return false
+        }
         val cx = xPx.coerceIn(windowXRange())
         val cy = yPx.coerceIn(windowYRange())
         val prevLpX = lp.x
@@ -1015,25 +1019,16 @@ open class PetOverlayService : Service() {
             }
         } else {
             val dt = 0.016
-            // 碰撞成员速度喂入（其它小肥鱼据此与我碰撞）
-            val m = collisionMember
-            if (m != null) {
-                m.vx = physVel[0]; m.vy = physVel[1]
-                // 碰撞结算改变了成员速度 → 采纳
-                val r0 = PetEngine.throwStep(
-                    physPos[0], physPos[1], physVel[0], physVel[1], dt,
-                    left, top, right, bottom,
-                )
-                physPos = doubleArrayOf(r0.px, r0.py)
-                physVel = doubleArrayOf(r0.vx, r0.vy)
-                m.vx = physVel[0]; m.vy = physVel[1]
-            }
             val r = PetEngine.throwStep(
                 physPos[0], physPos[1], physVel[0], physVel[1], dt,
                 left, top, right, bottom,
             )
             physPos = doubleArrayOf(r.px, r.py)
             physVel = doubleArrayOf(r.vx, r.vy)
+            collisionMember?.let {
+                it.vx = r.vx
+                it.vy = r.vy
+            }
             if (!moveWindow(physPos[0].roundToInt(), physPos[1].roundToInt(), fromPhysics = true)) {
                 return
             }
@@ -1283,6 +1278,20 @@ open class PetOverlayService : Service() {
     private fun savePosition() {
         scope.launch {
             stateStore?.save(PetState.State(engine.winX, engine.winY, engine.facing))
+        }
+    }
+
+    private fun savePositionDetached() {
+        val store = stateStore ?: return
+        val x = engine.winX
+        val y = engine.winY
+        val facing = engine.facing
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                store.save(PetState.State(x, y, facing))
+            }.onFailure { e ->
+                AppLog.log("SCOPE", android.util.Log.getStackTraceString(e))
+            }
         }
     }
 
