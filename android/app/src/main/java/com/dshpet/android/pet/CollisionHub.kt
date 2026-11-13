@@ -63,16 +63,24 @@ object CollisionHub {
     var onImpact: ((impactSpeed: Double) -> Unit)? = null
 
     /** 成员被撞后把新位置写回窗口（按实例 id 注册，服务侧各管各的） */
-    private val movedCallbacks = mutableMapOf<Int, (Member) -> Unit>()
+    private val movedCallbacks = mutableMapOf<Int, (Member) -> Boolean>()
 
-    @Synchronized
-    fun setOnMoved(id: Int, cb: ((Member) -> Unit)?) {
-        if (cb != null) movedCallbacks[id] = cb else movedCallbacks.remove(id)
+    private class MemberSnapshot(
+        val x: Double,
+        val y: Double,
+        val vx: Double,
+        val vy: Double,
+    )
+
+    fun setOnMoved(id: Int, cb: ((Member) -> Boolean)?) {
+        synchronized(movedCallbacks) {
+            if (cb != null) movedCallbacks[id] = cb else movedCallbacks.remove(id)
+        }
     }
 
     private val ticker = object : Runnable {
         override fun run() {
-            if (members.isEmpty()) {
+            if (synchronized(members) { members.isEmpty() }) {
                 ticking = false
                 return
             }
@@ -85,16 +93,14 @@ object CollisionHub {
         }
     }
 
-    @Synchronized
     fun register(m: Member) {
-        members[m.id] = m
+        synchronized(members) { members[m.id] = m }
         ensureTicking()
     }
 
-    @Synchronized
     fun unregister(id: Int) {
-        members.remove(id)
-        movedCallbacks.remove(id)
+        synchronized(members) { members.remove(id) }
+        synchronized(movedCallbacks) { movedCallbacks.remove(id) }
     }
 
     fun setEnabled(on: Boolean) {
@@ -114,6 +120,7 @@ object CollisionHub {
     private fun tick(): Boolean {
         if (!enabled) return false
         val list = synchronized(members) { members.values.filter { it.active } }
+        val before = list.associate { m -> m.id to MemberSnapshot(m.x, m.y, m.vx, m.vy) }
         var collided = false
         var maxImpact = 0.0
 
@@ -132,7 +139,27 @@ object CollisionHub {
         if (collided) {
             // 位置/速度变化写回（各服务把成员位置应用到窗口）
             val cbs = synchronized(movedCallbacks) { movedCallbacks.toMap() }
-            list.forEach { m -> cbs[m.id]?.invoke(m) }
+            list.forEach { m ->
+                val snapshot = before[m.id] ?: return@forEach
+                val changed = kotlin.math.abs(m.x - snapshot.x) > 1e-6 ||
+                    kotlin.math.abs(m.y - snapshot.y) > 1e-6 ||
+                    kotlin.math.abs(m.vx - snapshot.vx) > 1e-6 ||
+                    kotlin.math.abs(m.vy - snapshot.vy) > 1e-6
+                if (!changed) return@forEach
+                val cb = cbs[m.id]
+                val accepted = try {
+                    cb?.invoke(m) ?: false
+                } catch (e: Throwable) {
+                    AppLog.log("COLLISION", "moved 回调异常: ${e.message}")
+                    false
+                }
+                if (!accepted) {
+                    m.x = snapshot.x
+                    m.y = snapshot.y
+                    m.vx = 0.0
+                    m.vy = 0.0
+                }
+            }
         }
         return collided
     }
