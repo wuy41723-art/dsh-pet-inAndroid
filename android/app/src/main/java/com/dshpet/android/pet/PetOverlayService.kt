@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.graphics.PixelFormat
 import android.net.Uri
@@ -31,6 +32,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -123,6 +127,11 @@ open class PetOverlayService : Service() {
                 }
     )
     private val uiHandler = Handler(Looper.getMainLooper())
+    private var lastMoveLogMs = 0L
+    private var baseFlags = 0
+    private var initJob: Job? = null
+    private var collisionWriteBlockedUntil = 0L
+    private val geometryReconcile = Runnable { reconcileWindowGeometryNow() }
 
     private lateinit var config: PetConfig
     private var instanceId = 0
@@ -235,10 +244,13 @@ open class PetOverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (container == null) {
-            scope.launch {
+        if (container == null && initJob?.isActive != true) {
+            initJob = scope.launch {
+                val current = currentCoroutineContext()[Job]
                 try {
                     initPet()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Throwable) {
                     AppLog.log(
                         "INIT",
@@ -252,6 +264,8 @@ open class PetOverlayService : Service() {
                     synchronized(initFailed) { initFailed.add(instanceId) }
                     showBubble("桌宠初始化失败：${e.message}")
                     stopSelf()
+                } finally {
+                    if (initJob === current) initJob = null
                 }
             }
         }
@@ -263,6 +277,9 @@ open class PetOverlayService : Service() {
             "SVC",
             "onDestroy instance=$instanceId（用户退出/服务被杀/初始化失败均会到这）"
         )
+        initJob?.cancel()
+        initJob = null
+        uiHandler.removeCallbacks(geometryReconcile)
         synchronized(activeInstances) { activeInstances.remove(instanceId) }
         scope.cancel()
         uiHandler.removeCallbacksAndMessages(null)
@@ -279,7 +296,12 @@ open class PetOverlayService : Service() {
         dismissChat()
         easterEggs.forEach { it.dismiss() }
         easterEggs.clear()
-        container?.let { runCatching { wm.removeView(it) } }
+        container?.let { c ->
+            val removed = runCatching { wm.removeView(c) }.isSuccess
+            AppLog.log("SVC", "removeView instance=$instanceId ok=$removed")
+        }
+        container = null
+        params = null
         runCatching { videoView.release() }
         soundPool?.release()
         CoroutineScope(Dispatchers.Main).launch {
@@ -304,7 +326,7 @@ open class PetOverlayService : Service() {
         engine = PetEngine(
             catalog = catalog,
             play = { name -> playAnimation(name) },
-            moveTo = { x, y -> moveWindow(x, y) },
+            moveTo = { x, y -> moveWindow(x, y, fromAutoMove = true); Unit },
             onFacingChanged = { f -> videoView.setMirror(engine.shouldMirror(engine.anim ?: "")); persistFacing(f) },
             onMoveFinished = { savePosition() },
         ).apply {
@@ -318,33 +340,31 @@ open class PetOverlayService : Service() {
         val (ww, wh) = windowSizePx()
         engine.setWindowSize(ww, wh)
 
-        buildWindow()
-
-        // 手势
-        installGestures()
-
-        // 音效
-        setupSound()
-
-        // 恢复位置与朝向
         val st = stateStore!!.load()
         val (sx, sy) = screenPx()
         val savedX = st.x; val savedY = st.y
-        // 默认右下角：以鱼身（内容区）为参照贴边（右 70%、底 92% 处）
         val defaultX = (sx - engine.winW * 0.70 - 24).toInt()
         val defaultY = (sy - engine.winH * 0.92 - 12).toInt()
-        engine.setFacing(st.facing.ifEmpty { "left" })
-        videoView.setMirror(engine.shouldMirror(engine.anim ?: ""))
-        // 多开错位：新实例向右上偏移，避免与母体重叠
         val offsetX = if (instanceId > 0) (instanceId * 48).coerceAtMost(engine.winW / 2) else 0
         val offsetY = if (instanceId > 0) (instanceId * 32).coerceAtMost(engine.winH / 2) else 0
         val xr = windowXRange(); val yr = windowYRange()
-        engine.setPosition(
+        val initialX =
             if (savedX >= 0) savedX.coerceIn(xr.first, xr.last)
-            else (defaultX - offsetX).coerceIn(xr.first, xr.last),
+            else (defaultX - offsetX).coerceIn(xr.first, xr.last)
+        val initialY =
             if (savedY >= 0) savedY.coerceIn(yr.first, yr.last)
-            else (defaultY - offsetY).coerceIn(yr.first, yr.last),
-        )
+            else (defaultY - offsetY).coerceIn(yr.first, yr.last)
+
+        currentCoroutineContext().ensureActive()
+
+        engine.syncPosition(initialX, initialY)
+        buildWindow(initialX, initialY)
+
+        installGestures()
+        setupSound()
+
+        engine.setFacing(st.facing.ifEmpty { "left" })
+        videoView.setMirror(engine.shouldMirror(engine.anim ?: ""))
         syncEngineScreenBounds()
         AppLog.log("SVC", "窗口与手势就绪 ${android.os.SystemClock.elapsedRealtime() - t0}ms")
 
@@ -402,24 +422,30 @@ open class PetOverlayService : Service() {
             CollisionHub.register(m)
             // 碰撞结算写回：本实例被撞 → 更新窗口/被撞飞进入抛掷
             CollisionHub.setOnMoved(instanceId) { member ->
-                uiHandler.post {
-                    if (dragging) return@post
-                    val speed = kotlin.math.hypot(member.vx, member.vy)
-                    if (physMode == null) {
-                        if (speed > 60) {
-                            // 静止的鱼被撞飞
-                            physPos = doubleArrayOf(member.x, member.y)
-                            physVel = doubleArrayOf(member.vx, member.vy)
-                            physMode = "throw"
-                        } else {
-                            moveWindow(member.x.roundToInt(), member.y.roundToInt())
-                            savePosition()
-                        }
-                    } else {
-                        // 抛掷中的鱼：采纳碰撞后的速度
-                        physVel = doubleArrayOf(member.vx, member.vy)
-                    }
+                if (dragging) return@setOnMoved false
+                if (System.currentTimeMillis() < collisionWriteBlockedUntil) return@setOnMoved false
+                val targetX = member.x.roundToInt()
+                val targetY = member.y.roundToInt()
+                val positionChanged = targetX != engine.winX || targetY != engine.winY
+                if (positionChanged) {
+                    val ok = moveWindow(targetX, targetY, fromCollision = true)
+                    if (!ok) return@setOnMoved false
                 }
+                val appliedX = collisionMember?.x ?: member.x
+                val appliedY = collisionMember?.y ?: member.y
+                val speed = kotlin.math.hypot(member.vx, member.vy)
+                if (physMode == null) {
+                    if (speed > 60) {
+                        physPos = doubleArrayOf(appliedX, appliedY)
+                        physVel = doubleArrayOf(member.vx, member.vy)
+                        physMode = "throw"
+                    }
+                } else {
+                    physPos = doubleArrayOf(appliedX, appliedY)
+                    physVel = doubleArrayOf(member.vx, member.vy)
+                }
+                if (positionChanged) savePosition()
+                true
             }
         }
         scheduleSelfTalk()
@@ -447,13 +473,91 @@ open class PetOverlayService : Service() {
     /** 桌宠显示/隐藏（灵动岛单击；仅主实例处理） */
     private fun setHidden(hidden: Boolean) {
         if (instanceId != 0) return
-        petHidden = hidden
-        val c = container
-        if (c != null) {
-            uiHandler.post { c.visibility = if (hidden) View.GONE else View.VISIBLE }
+        val c = container ?: return
+        val lp = params ?: return
+        uiHandler.post {
+            val oldFlags = lp.flags
+            val oldVisibility = c.visibility
+            val oldPetHidden = petHidden
+            lp.flags = if (hidden) {
+                baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                baseFlags
+            }
+            c.visibility = if (hidden) View.GONE else View.VISIBLE
+            val applied = runCatching { wm.updateViewLayout(c, lp) }.isSuccess
+            if (!applied) {
+                lp.flags = oldFlags
+                c.visibility = oldVisibility
+                val restored = runCatching { wm.updateViewLayout(c, lp) }.isSuccess
+                petHidden = oldPetHidden
+                AppLog.log("SVC", "桌宠${if (hidden) "隐藏" else "显示"}失败 instance=$instanceId flagsRestored=$restored")
+                return@post
+            }
+            petHidden = hidden
             if (hidden) videoView.pausePlay() else videoView.resumePlay()
-            AppLog.log("SVC", "桌宠 ${if (hidden) "隐藏" else "显示"}")
+            AppLog.log("SVC", "桌宠${if (hidden) "隐藏" else "显示"}成功 instance=$instanceId touchable=${!hidden}")
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        density = resources.displayMetrics.density
+        queueWindowGeometryReconcile()
+    }
+
+    private fun queueWindowGeometryReconcile() {
+        uiHandler.removeCallbacks(geometryReconcile)
+        uiHandler.post(geometryReconcile)
+    }
+
+    private fun cancelActiveGestures() {
+        uiHandler.removeCallbacks(longPressRunnable)
+        if (dragging) engine.onDragEnd()
+        dragging = false
+        pressActive = false
+        longPressFired = false
+        justDragged = false
+        slingshotAiming = false
+        physMode = null
+        physVel = doubleArrayOf(0.0, 0.0)
+        physPos = doubleArrayOf(engine.winX.toDouble(), engine.winY.toDouble())
+        dragTargetX = engine.winX
+        dragTargetY = engine.winY
+        trail.clear()
+        collisionMember?.let { it.vx = 0.0; it.vy = 0.0; it.infiniteMass = false }
+        engine.cancelMove()
+    }
+
+    private fun reconcileWindowGeometryNow() {
+        val c = container ?: return
+        val lp = params ?: return
+        cancelActiveGestures()
+        val oldW = lp.width; val oldH = lp.height
+        val oldX = lp.x; val oldY = lp.y
+        val (ww, wh) = windowSizePx()
+        val newX = engine.winX.coerceIn(windowXRangeFor(ww))
+        val newY = engine.winY.coerceIn(windowYRangeFor(wh))
+        lp.width = ww; lp.height = wh; lp.x = newX; lp.y = newY
+        val result = runCatching { wm.updateViewLayout(c, lp) }
+        if (result.isFailure) {
+            lp.width = oldW; lp.height = oldH; lp.x = oldX; lp.y = oldY
+            val restoreResult = runCatching { wm.updateViewLayout(c, lp) }
+            val restored = restoreResult.isSuccess
+            val now = System.currentTimeMillis()
+            if (now - lastMoveLogMs >= 1000) {
+                lastMoveLogMs = now
+                AppLog.log("SVC", "reconcile 失败 instance=$instanceId gesturesCancelled=true old=(${oldW}x$oldH@$oldX,$oldY) new=(${ww}x$wh@$newX,$newY) restoreOk=$restored submitErr=${result.exceptionOrNull()?.message} restoreErr=${restoreResult.exceptionOrNull()?.message}")
+            }
+            if (!restored) AppLog.log("SVC", "reconcile 恢复失败：实际窗口几何不确定 instance=$instanceId")
+            return
+        }
+        engine.setWindowSize(ww, wh)
+        engine.syncPosition(newX, newY)
+        collisionMember?.let { it.x = newX.toDouble(); it.y = newY.toDouble(); it.w = ww; it.h = wh }
+        syncEngineScreenBounds()
+        savePosition()
+        AppLog.log("SVC", "reconcile 成功 instance=$instanceId ${ww}x$wh lp=($newX,$newY) engine=(${engine.winX},${engine.winY})")
     }
 
     /** 菜单入口：切换（显示↔隐藏） */
@@ -553,7 +657,11 @@ open class PetOverlayService : Service() {
         bubble?.showText(text, durationMs = curSelfTalkDurationMs.coerceIn(1000, 30000))
     }
 
-    private fun buildWindow() {
+    private fun buildWindow(initialX: Int, initialY: Int) {
+        if (container != null) {
+            AppLog.log("SVC", "buildWindow 跳过：已有窗口 instance=$instanceId")
+            return
+        }
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val w = engine.winW
         val h = engine.winH
@@ -567,10 +675,12 @@ open class PetOverlayService : Service() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             title = "dsh-pet-$instanceId"
+            x = initialX
+            y = initialY
         }
+        baseFlags = lp.flags
         params = lp
 
-        // 纯代码创建视图（避免 XML inflate 自定义 View 的兼容性问题）
         val root = android.widget.FrameLayout(this).apply {
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
         }
@@ -588,7 +698,6 @@ open class PetOverlayService : Service() {
             }
 
             override fun onVideoError(name: String, msg: String) {
-                // 出错时推进动画链，避免停摆；连续出错则停止并提示（防死循环）
                 AppLog.log("VIDEO", "播放失败 [$name]: $msg")
                 consecutiveErrors++
                 if (consecutiveErrors > 8) {
@@ -599,8 +708,18 @@ open class PetOverlayService : Service() {
                 }
             }
         })
+        try {
+            wm.addView(root, lp)
+        } catch (e: Throwable) {
+            val cleaned = runCatching { wm.removeView(root) }.isSuccess
+            container = null
+            params = null
+            AppLog.log("SVC", "addView 失败 instance=$instanceId at ($initialX,$initialY) cleanup=$cleaned ${e.javaClass.simpleName}: ${e.message}")
+            throw e
+        }
         container = root
-        wm.addView(root, lp)
+        engine.syncPosition(initialX, initialY)
+        AppLog.log("SVC", "buildWindow instance=$instanceId lp=($initialX,$initialY) ${w}x$h")
     }
 
     // ================================================================ 动画播放
@@ -707,33 +826,48 @@ open class PetOverlayService : Service() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     uiHandler.removeCallbacks(longPressRunnable)
+                    val cancelled = ev.actionMasked == MotionEvent.ACTION_CANCEL
+                    if (cancelled) {
+                        if (dragging) engine.onDragEnd()
+                        dragging = false
+                        pressActive = false
+                        longPressFired = false
+                        justDragged = false
+                        slingshotAiming = false
+                        physMode = null
+                        physVel = doubleArrayOf(0.0, 0.0)
+                        physPos = doubleArrayOf(engine.winX.toDouble(), engine.winY.toDouble())
+                        dragTargetX = engine.winX
+                        dragTargetY = engine.winY
+                        trail.clear()
+                        collisionMember?.let { it.vx = 0.0; it.vy = 0.0; it.infiniteMass = false }
+                        engine.cancelMove()
+                        savePosition()
+                        return@setOnTouchListener true
+                    }
+                    val wasSlingshot = slingshotAiming
+                    slingshotAiming = false
                     if (dragging) {
                         justDragged = true
                         uiHandler.postDelayed({ justDragged = false }, 150)
                         engine.onDragEnd()
                         collisionMember?.infiniteMass = false
-                        // 弹弓发射：按蓄力拉伸发射
-                        if (slingshotAiming) {
-                            slingshotAiming = false
+                        if (wasSlingshot) {
                             val pullX = (slingshotAnchorX - ev.rawX).toDouble()
                             val pullY = (slingshotAnchorY - ev.rawY).toDouble()
                             val dist = hypot(pullX, pullY).coerceIn(24.0, 160.0)
                             val cap = PetEngine.throwSpeedCap(curThrowStrength)
-                            val speed = PetEngine.softClampSpeed(
-                                900.0 * (dist / 160.0) * (cap / 4800.0), cap
-                            )
+                            val speed = PetEngine.softClampSpeed(900.0 * (dist / 160.0) * (cap / 4800.0), cap)
                             if (dist > 24 && speed > 1) {
                                 val len = max(hypot(pullX, pullY), 1e-6)
-                                physVel = doubleArrayOf(
-                                    pullX / len * speed,
-                                    pullY / len * speed,
-                                )
+                                physVel = doubleArrayOf(pullX / len * speed, pullY / len * speed)
                                 physPos = doubleArrayOf(engine.winX.toDouble(), engine.winY.toDouble())
                                 physMode = "throw"
+                            } else {
+                                physMode = null
+                                savePosition()
                             }
-                            return@setOnTouchListener true
-                        }
-                        if (curPhysics) {
+                        } else if (curPhysics) {
                             val now = System.currentTimeMillis()
                             val (vx, vy) = PetEngine.estimateReleaseVelocity(trail, now)
                             if (hypot(vx, vy) < PetEngine.DEAD_ZONE_SPEED) {
@@ -811,20 +945,52 @@ open class PetOverlayService : Service() {
     }
 
     // ================================================================ 移动窗口
-    private fun moveWindow(xPx: Int, yPx: Int) {
-        val lp = params ?: return
-        val c = container ?: return
-        // 溢出 clamp：鱼身视觉贴边（见 overflowX 注释）
+    private fun moveWindow(
+        xPx: Int,
+        yPx: Int,
+        fromAutoMove: Boolean = false,
+        fromCollision: Boolean = false,
+        fromPhysics: Boolean = false,
+    ): Boolean {
+        val lp = params ?: return false
+        val c = container ?: return false
         val cx = xPx.coerceIn(windowXRange())
         val cy = yPx.coerceIn(windowYRange())
+        val prevLpX = lp.x
+        val prevLpY = lp.y
+        val prevEngineX = engine.winX
+        val prevEngineY = engine.winY
         lp.x = cx
         lp.y = cy
-        runCatching { wm.updateViewLayout(c, lp) }
-        collisionMember?.let {
-            it.x = cx.toDouble(); it.y = cy.toDouble()
-            it.w = engine.winW; it.h = engine.winH
+        val result = runCatching { wm.updateViewLayout(c, lp) }
+        if (result.isFailure) {
+            val failedPhysMode = physMode
+            lp.x = prevLpX
+            lp.y = prevLpY
+            engine.syncPosition(prevEngineX, prevEngineY)
+            if (fromAutoMove) engine.cancelMove()
+            if (fromPhysics) {
+                physMode = null
+                physVel = doubleArrayOf(0.0, 0.0)
+                physPos = doubleArrayOf(prevEngineX.toDouble(), prevEngineY.toDouble())
+                collisionMember?.let { it.vx = 0.0; it.vy = 0.0 }
+            }
+            if (fromCollision) collisionWriteBlockedUntil = System.currentTimeMillis() + 500
+            val now = System.currentTimeMillis()
+            if (now - lastMoveLogMs >= 1000) {
+                lastMoveLogMs = now
+                AppLog.log("SVC", "moveWindow 失败 instance=$instanceId auto=$fromAutoMove collision=$fromCollision physics=$fromPhysics physBefore=$failedPhysMode dragging=$dragging req=($cx,$cy) lp=($prevLpX,$prevLpY) engine=($prevEngineX,$prevEngineY) err=${result.exceptionOrNull()?.message}")
+            }
+            return false
         }
+        collisionMember?.let { it.x = cx.toDouble(); it.y = cy.toDouble(); it.w = engine.winW; it.h = engine.winH }
         engine.syncPosition(cx, cy)
+        val now = System.currentTimeMillis()
+        if (now - lastMoveLogMs >= 1000) {
+            lastMoveLogMs = now
+            AppLog.log("SVC", "moveWindow ok instance=$instanceId auto=$fromAutoMove collision=$fromCollision physics=$fromPhysics lp=($cx,$cy) engine=(${engine.winX},${engine.winY})")
+        }
+        return true
     }
 
     private fun tickPhysics() {
@@ -844,7 +1010,9 @@ open class PetOverlayService : Service() {
             val vy = physVel[1] + ((ty - physPos[1]) * k - physVel[1] * c) * dt
             physVel[0] = vx; physVel[1] = vy
             physPos[0] += vx * dt; physPos[1] += vy * dt
-            moveWindow(physPos[0].roundToInt(), physPos[1].roundToInt())
+            if (!moveWindow(physPos[0].roundToInt(), physPos[1].roundToInt(), fromPhysics = true)) {
+                return
+            }
         } else {
             val dt = 0.016
             // 碰撞成员速度喂入（其它小肥鱼据此与我碰撞）
@@ -866,7 +1034,9 @@ open class PetOverlayService : Service() {
             )
             physPos = doubleArrayOf(r.px, r.py)
             physVel = doubleArrayOf(r.vx, r.vy)
-            moveWindow(physPos[0].roundToInt(), physPos[1].roundToInt())
+            if (!moveWindow(physPos[0].roundToInt(), physPos[1].roundToInt(), fromPhysics = true)) {
+                return
+            }
             val speed = hypot(r.vx, r.vy)
             if (PetEngine.isAtRest(r.py, r.vx, r.vy, bottom, r.bounced, speed)) {
                 physMode = null
@@ -1200,17 +1370,20 @@ open class PetOverlayService : Service() {
     private fun overflowY(): Int = (engine.winH * 0.10).toInt()
 
     /** 窗口水平可移动范围（含溢出） */
-    private fun windowXRange(): IntRange {
+    private fun windowXRange(): IntRange = windowXRangeFor(engine.winW)
+
+    private fun windowXRangeFor(windowW: Int): IntRange {
         val (sw, _) = screenPx()
-        val ov = overflowX()
-        return -ov..maxOf(-ov, sw - engine.winW + ov)
+        val ov = (windowW * 0.26).toInt()
+        return -ov..maxOf(-ov, sw - windowW + ov)
     }
 
-    /** 窗口垂直可移动范围（含溢出） */
-    private fun windowYRange(): IntRange {
+    private fun windowYRange(): IntRange = windowYRangeFor(engine.winH)
+
+    private fun windowYRangeFor(windowH: Int): IntRange {
         val (_, sh) = screenPx()
-        val ov = overflowY()
-        return -ov..maxOf(-ov, sh - engine.winH + ov)
+        val ov = (windowH * 0.10).toInt()
+        return -ov..maxOf(-ov, sh - windowH + ov)
     }
 
     /** 同步引擎屏幕边界（自动散步范围；含溢出） */
